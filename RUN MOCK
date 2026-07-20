@@ -1,0 +1,1494 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Benchmark a local 9B model against ERP/MES mock data.
+
+The script can load the mock data from local CSV files or from the two mock API
+services, generate deterministic test cases with answer keys, call Ollama, score
+the answers, and write a Markdown report plus JSONL raw results.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import dataclasses
+import datetime as dt
+import json
+import math
+import os
+import random
+import re
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+ERP_TABLES = {"t01", "t02", "t03", "t04", "t05", "t06", "t08", "t09"}
+MES_TABLES = {"t07", "t10", "t11", "t12"}
+
+TABLE_NAMES = {
+    "t01": "供应商主数据",
+    "t03": "BOM物料清单",
+    "t05": "采购订单",
+    "t06": "采购到货记录",
+    "t07": "生产工单",
+    "t08": "物料库存快照",
+    "t10": "MES物料领用记录",
+    "t11": "MES质检批次记录",
+    "t12": "MES计量参数记录",
+}
+
+DEFAULT_ERP_API = "http://114.215.204.62:8005"
+DEFAULT_MES_API = "http://114.215.204.62:8006"
+DEFAULT_ERP_TOKEN = "erp-token-2026"
+DEFAULT_MES_TOKEN = "mes-token-2026"
+
+SYSTEM_PROMPT = """你是制造业 ERP/MES 数据分析助手。
+你必须只依据用户提供的数据回答，不要编造外部信息。
+请简洁作答；如果需要计算，给出关键结果即可。
+最后一行必须以 `FINAL:` 开头，写出最终结论。"""
+
+
+@dataclasses.dataclass
+class TableData:
+    table_id: str
+    name: str
+    service: str
+    file: str
+    columns: List[str]
+    rows: List[Dict[str, str]]
+
+
+@dataclasses.dataclass
+class Case:
+    case_id: str
+    category: str
+    difficulty: str
+    source_tables: List[str]
+    question: str
+    context: str
+    expected: str
+    scoring: Dict[str, Any]
+    tags: List[str] = dataclasses.field(default_factory=list)
+
+    def prompt(self) -> str:
+        return (
+            f"任务编号: {self.case_id}\n"
+            f"任务类型: {self.category}\n\n"
+            f"【数据上下文】\n{self.context}\n\n"
+            f"【问题】\n{self.question}\n\n"
+            "【回答要求】\n"
+            "1. 使用中文。\n"
+            "2. 如果问题要求 JSON，只输出一个合法 JSON 对象，并在 FINAL 行重复核心结论。\n"
+            "3. 最后一行必须写成 `FINAL: <最终答案>`。\n"
+        )
+
+
+def utc_now_text() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def table_service(table_id: str) -> str:
+    tid = table_id.lower()
+    if tid in MES_TABLES:
+        return "MES"
+    return "ERP"
+
+
+def table_name(table_id: str) -> str:
+    return TABLE_NAMES.get(table_id.lower(), table_id.lower())
+
+
+def table_id_from_filename(path: Path) -> str:
+    match = re.match(r"^(T\d+)", path.stem, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return re.sub(r"\W+", "_", path.stem).strip("_").lower()
+
+
+def clean_row(row: Dict[str, Any]) -> Dict[str, str]:
+    cleaned: Dict[str, str] = {}
+    for key, value in row.items():
+        if key is None:
+            continue
+        k = str(key).strip()
+        if value is None:
+            cleaned[k] = ""
+        else:
+            cleaned[k] = str(value).strip()
+    return cleaned
+
+
+def load_from_csv(csv_dir: str) -> Dict[str, TableData]:
+    base = Path(csv_dir).expanduser()
+    if not base.exists() or not base.is_dir():
+        raise FileNotFoundError(f"CSV directory does not exist: {base}")
+
+    tables: Dict[str, TableData] = {}
+    for path in sorted(base.glob("*.csv")):
+        table_id = table_id_from_filename(path)
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            columns = [c.strip() for c in (reader.fieldnames or [])]
+            rows = [clean_row(row) for row in reader]
+        if not columns:
+            continue
+        tables[table_id] = TableData(
+            table_id=table_id,
+            name=table_name(table_id),
+            service=table_service(table_id),
+            file=path.name,
+            columns=columns,
+            rows=rows,
+        )
+    if not tables:
+        raise ValueError(f"No CSV tables found in {base}")
+    return tables
+
+
+def http_json(
+    url: str,
+    method: str = "GET",
+    body: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 60,
+) -> Dict[str, Any]:
+    data = None
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach {url}: {exc}") from exc
+
+
+def fetch_service_tables(base_url: str, token: str, service_name: str) -> Dict[str, TableData]:
+    base = base_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {token}"}
+    listing = http_json(f"{base}/api/tables", headers=headers, timeout=30)
+    tables: Dict[str, TableData] = {}
+    for meta in listing.get("tables", []):
+        table_id = str(meta.get("id", "")).lower()
+        if not table_id:
+            continue
+        total = int(meta.get("rows") or 0)
+        payload = http_json(
+            f"{base}/api/tables/{table_id}?limit=5000&offset=0",
+            headers=headers,
+            timeout=60,
+        )
+        rows = [clean_row(row) for row in payload.get("rows", [])]
+        columns = [str(c) for c in payload.get("columns", meta.get("columns", []))]
+        if total and len(rows) < total:
+            raise RuntimeError(
+                f"{service_name} {table_id} returned {len(rows)} rows, expected {total}; "
+                "increase API limit support before benchmarking."
+            )
+        tables[table_id] = TableData(
+            table_id=table_id,
+            name=TABLE_NAMES.get(table_id, str(meta.get("name", table_id))),
+            service=service_name,
+            file=str(meta.get("file", "")),
+            columns=columns,
+            rows=rows,
+        )
+    return tables
+
+
+def load_from_api(args: argparse.Namespace) -> Dict[str, TableData]:
+    tables = {}
+    tables.update(fetch_service_tables(args.erp_api, args.erp_token, "ERP"))
+    tables.update(fetch_service_tables(args.mes_api, args.mes_token, "MES"))
+    if not tables:
+        raise ValueError("No tables fetched from mock APIs")
+    return tables
+
+
+def num(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    text = str(value).strip().replace(",", "")
+    if text == "":
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def date_value(value: Any) -> Optional[dt.date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def fmt_number(value: float, digits: int = 2) -> str:
+    if math.isfinite(value) and abs(value - round(value)) < 1e-9:
+        return f"{int(round(value))}"
+    return f"{value:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def fmt_pct(value: float, digits: int = 1) -> str:
+    return f"{value * 100:.{digits}f}%"
+
+
+def markdown_table(rows: Sequence[Dict[str, Any]], columns: Optional[Sequence[str]] = None, max_rows: int = 20) -> str:
+    selected = list(rows[:max_rows])
+    if not selected:
+        return "_无数据_"
+    cols = list(columns or selected[0].keys())
+
+    def cell(value: Any) -> str:
+        text = str(value if value is not None else "")
+        text = text.replace("\n", " ").replace("|", "/")
+        return text
+
+    lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
+    for row in selected:
+        lines.append("| " + " | ".join(cell(row.get(col, "")) for col in cols) + " |")
+    if len(rows) > max_rows:
+        lines.append(f"| ... | {' | '.join([''] * (len(cols) - 1))} |")
+    return "\n".join(lines)
+
+
+def compact_schema(tables: Dict[str, TableData], ids: Sequence[str]) -> str:
+    lines = []
+    for table_id in ids:
+        table = tables.get(table_id)
+        if not table:
+            continue
+        cols = "、".join(table.columns)
+        lines.append(f"- {table.service}.{table.table_id} {table.name}: {cols}")
+    return "\n".join(lines)
+
+
+def first_row(rows: Iterable[Dict[str, str]], predicate) -> Optional[Dict[str, str]]:
+    for row in rows:
+        try:
+            if predicate(row):
+                return row
+        except Exception:
+            continue
+    return None
+
+
+def group_by(rows: Iterable[Dict[str, str]], key: str) -> Dict[str, List[Dict[str, str]]]:
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(row.get(key, ""), []).append(row)
+    return grouped
+
+
+def add_case(cases: List[Case], case: Optional[Case]) -> None:
+    if case is not None:
+        cases.append(case)
+
+
+def build_cases(tables: Dict[str, TableData], max_cases: int = 0) -> List[Case]:
+    rng = random.Random(20260720)
+    cases: List[Case] = []
+
+    if "t05" in tables:
+        add_case(
+            cases,
+            Case(
+                case_id="API-001",
+                category="api_planning",
+                difficulty="easy",
+                source_tables=["t05"],
+                context=(
+                    "服务与鉴权信息:\n"
+                    f"- ERP: {DEFAULT_ERP_API}, token={DEFAULT_ERP_TOKEN}\n"
+                    f"- MES: {DEFAULT_MES_API}, token={DEFAULT_MES_TOKEN}\n\n"
+                    "已知表结构:\n" + compact_schema(tables, ["t01", "t03", "t05", "t06", "t08", "t07", "t10", "t11", "t12"])
+                ),
+                question="如果要查询采购订单的供应商、物料、采购数量、已到货量、单价和采购状态，应访问哪套服务、哪个表、哪个接口路径，并使用哪个 token？",
+                expected="ERP 服务，t05 采购订单，GET /api/tables/t05，token erp-token-2026。",
+                scoring={
+                    "type": "contains_all",
+                    "terms": ["ERP", "t05", "/api/tables/t05", "erp-token-2026"],
+                },
+                tags=["routing", "schema"],
+            ),
+        )
+
+    if "t06" in tables and "t11" in tables:
+        add_case(
+            cases,
+            Case(
+                case_id="API-002",
+                category="api_planning",
+                difficulty="medium",
+                source_tables=["t06", "t11"],
+                context=(
+                    "服务与鉴权信息:\n"
+                    f"- ERP: {DEFAULT_ERP_API}, token={DEFAULT_ERP_TOKEN}\n"
+                    f"- MES: {DEFAULT_MES_API}, token={DEFAULT_MES_TOKEN}\n\n"
+                    "跨源追溯线索: ERP t06 的 `批次号` 可以关联 MES t11 的 `批次号`。\n\n"
+                    "相关表结构:\n" + compact_schema(tables, ["t06", "t11"])
+                ),
+                question="要从一次采购到货追溯到对应质检结论，应该分别访问哪两个服务、哪两张表、使用哪些 token，并按哪个字段关联？",
+                expected="访问 ERP.t06 和 MES.t11，分别使用 erp-token-2026 与 mes-token-2026，按批次号关联。",
+                scoring={
+                    "type": "contains_all",
+                    "terms": ["ERP", "MES", "t06", "t11", "erp-token-2026", "mes-token-2026", "批次号"],
+                },
+                tags=["routing", "join"],
+            ),
+        )
+
+    if "t12" in tables:
+        add_case(
+            cases,
+            Case(
+                case_id="API-003",
+                category="api_planning",
+                difficulty="easy",
+                source_tables=["t12"],
+                context=(
+                    "服务与鉴权信息:\n"
+                    f"- ERP: {DEFAULT_ERP_API}, token={DEFAULT_ERP_TOKEN}\n"
+                    f"- MES: {DEFAULT_MES_API}, token={DEFAULT_MES_TOKEN}\n\n"
+                    "相关表结构:\n" + compact_schema(tables, ["t12"])
+                ),
+                question="如果要查询设备/仪表采集参数是否异常，应访问哪套服务、哪个表、哪个接口路径和 token？",
+                expected="MES 服务，t12 计量参数记录，GET /api/tables/t12，token mes-token-2026。",
+                scoring={
+                    "type": "contains_all",
+                    "terms": ["MES", "t12", "/api/tables/t12", "mes-token-2026"],
+                },
+                tags=["routing", "schema"],
+            ),
+        )
+
+    t05 = tables.get("t05")
+    if t05 and t05.rows:
+        row = t05.rows[0]
+        add_case(
+            cases,
+            Case(
+                case_id="LKP-001",
+                category="single_table_lookup",
+                difficulty="easy",
+                source_tables=["t05"],
+                context=markdown_table([row], ["采购订单行ID", "采购订单号", "供应商名称", "物料名称", "采购数量", "已到货量", "含税单价(元)", "采购状态"]),
+                question=f"采购订单行ID `{row.get('采购订单行ID')}` 对应的供应商、采购数量、含税单价和采购状态分别是什么？",
+                expected=f"{row.get('供应商名称')}，采购数量 {row.get('采购数量')}，含税单价 {row.get('含税单价(元)')} 元，状态 {row.get('采购状态')}。",
+                scoring={
+                    "type": "contains_all",
+                    "terms": [row.get("供应商名称", ""), row.get("采购数量", ""), row.get("含税单价(元)", ""), row.get("采购状态", "")],
+                },
+                tags=["lookup"],
+            ),
+        )
+
+        partial = first_row(t05.rows, lambda r: num(r.get("采购数量")) > 0 and 0 < num(r.get("已到货量")) < num(r.get("采购数量")))
+        if partial:
+            qty = num(partial.get("采购数量"))
+            arrived = num(partial.get("已到货量"))
+            rate = arrived / qty if qty else 0
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-001",
+                    category="calculation",
+                    difficulty="easy",
+                    source_tables=["t05"],
+                    context=markdown_table([partial], ["采购订单号", "物料名称", "采购数量", "已到货量", "采购状态"]),
+                    question="请计算该采购订单行的到货完成率，并判断是否已全部到货。",
+                    expected=f"到货完成率 {fmt_pct(rate)}，未全部到货。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": ["未", "到货"],
+                        "numbers": [{"value": rate * 100, "tolerance": 0.2}],
+                    },
+                    tags=["math", "ratio"],
+                ),
+            )
+
+        groups = [rows for rows in group_by(t05.rows, "供应商编码").values() if len(rows) >= 3]
+        if groups:
+            rows = sorted(groups[0], key=lambda r: r.get("采购订单行ID", ""))[:3]
+            total_qty = sum(num(r.get("采购数量")) for r in rows)
+            total_amount = sum(num(r.get("采购数量")) * num(r.get("含税单价(元)")) for r in rows)
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-002",
+                    category="calculation",
+                    difficulty="medium",
+                    source_tables=["t05"],
+                    context=markdown_table(rows, ["采购订单行ID", "供应商编码", "供应商名称", "物料名称", "采购数量", "含税单价(元)"]),
+                    question="请汇总这 3 行采购订单的采购数量合计，以及含税采购金额合计。金额=采购数量*含税单价。",
+                    expected=f"采购数量合计 {fmt_number(total_qty)}，含税采购金额合计 {fmt_number(total_amount)} 元。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": ["合计"],
+                        "numbers": [
+                            {"value": total_qty, "tolerance": 0.01},
+                            {"value": total_amount, "tolerance": 1.0},
+                        ],
+                    },
+                    tags=["math", "amount"],
+                ),
+            )
+
+        dated = [
+            r
+            for r in t05.rows
+            if date_value(r.get("要求到货日")) and date_value(r.get("供应商确认到货日"))
+        ][:8]
+        if len(dated) >= 5:
+            rows = dated[:5]
+            delays = []
+            for r in rows:
+                req = date_value(r.get("要求到货日"))
+                conf = date_value(r.get("供应商确认到货日"))
+                days = (conf - req).days if req and conf else 0
+                if days > 0:
+                    delays.append((r, days))
+            max_delay = max([d for _, d in delays], default=0)
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-003",
+                    category="date_reasoning",
+                    difficulty="medium",
+                    source_tables=["t05"],
+                    context=markdown_table(rows, ["采购订单号", "供应商名称", "要求到货日", "供应商确认到货日"]),
+                    question="这些订单中有几行供应商确认到货日晚于要求到货日？最大延期多少天？",
+                    expected=f"延期 {len(delays)} 行，最大延期 {max_delay} 天。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": ["延期"],
+                        "numbers": [
+                            {"value": len(delays), "tolerance": 0.01},
+                            {"value": max_delay, "tolerance": 0.01},
+                        ],
+                    },
+                    tags=["date", "math"],
+                ),
+            )
+
+    t06 = tables.get("t06")
+    if t06 and t06.rows:
+        row = t06.rows[0]
+        add_case(
+            cases,
+            Case(
+                case_id="LKP-002",
+                category="single_table_lookup",
+                difficulty="easy",
+                source_tables=["t06"],
+                context=markdown_table([row], ["到货记录ID", "到货单号", "采购订单号", "物料编码", "实际到货日期", "到货数量", "批次号", "检验状态"]),
+                question=f"到货记录 `{row.get('到货记录ID')}` 的批次号、到货数量和检验状态是什么？",
+                expected=f"批次号 {row.get('批次号')}，到货数量 {row.get('到货数量')}，检验状态 {row.get('检验状态')}。",
+                scoring={
+                    "type": "contains_all",
+                    "terms": [row.get("批次号", ""), row.get("到货数量", ""), row.get("检验状态", "")],
+                },
+                tags=["lookup"],
+            ),
+        )
+
+    t11 = tables.get("t11")
+    if t06 and t11:
+        qc_by_batch = {r.get("批次号", ""): r for r in t11.rows if r.get("批次号")}
+        joined = None
+        for receipt in t06.rows:
+            qc = qc_by_batch.get(receipt.get("批次号", ""))
+            if qc:
+                joined = (receipt, qc)
+                break
+        if joined:
+            receipt, qc = joined
+            add_case(
+                cases,
+                Case(
+                    case_id="JOIN-001",
+                    category="cross_table_join",
+                    difficulty="medium",
+                    source_tables=["t06", "t11"],
+                    context=(
+                        "ERP.t06 到货记录:\n"
+                        + markdown_table([receipt], ["到货单号", "采购订单号", "物料编码", "到货数量", "批次号", "检验状态"])
+                        + "\n\nMES.t11 质检记录:\n"
+                        + markdown_table([qc], ["质检记录ID", "批次号", "物料/货品编码", "送检数量", "合格数量", "不合格数量", "合格率", "检验结论"])
+                    ),
+                    question="请按批次号关联这两条记录，说明到货检验状态与 MES 质检结论，并给出合格率。",
+                    expected=f"批次号 {receipt.get('批次号')}，到货检验状态 {receipt.get('检验状态')}，MES 质检结论 {qc.get('检验结论')}，合格率 {qc.get('合格率')}。",
+                    scoring={
+                        "type": "contains_all",
+                        "terms": [receipt.get("批次号", ""), receipt.get("检验状态", ""), qc.get("检验结论", ""), qc.get("合格率", "")],
+                    },
+                    tags=["join", "quality"],
+                ),
+            )
+
+    if t11 and t11.rows:
+        supplier_stats = []
+        for supplier, rows in group_by(t11.rows, "供应商编码").items():
+            sent = sum(num(r.get("送检数量")) for r in rows)
+            good = sum(num(r.get("合格数量")) for r in rows)
+            if supplier and sent > 0 and len(rows) >= 2:
+                supplier_stats.append(
+                    {
+                        "供应商编码": supplier,
+                        "送检批次数": str(len(rows)),
+                        "送检数量": fmt_number(sent),
+                        "合格数量": fmt_number(good),
+                        "综合合格率": fmt_pct(good / sent, 2),
+                        "_rate": good / sent,
+                    }
+                )
+        if supplier_stats:
+            supplier_stats.sort(key=lambda r: (r["_rate"], -num(r["送检数量"])))
+            rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in supplier_stats[:5]]
+            worst = supplier_stats[0]
+            add_case(
+                cases,
+                Case(
+                    case_id="AGG-001",
+                    category="aggregation",
+                    difficulty="medium",
+                    source_tables=["t11"],
+                    context=markdown_table(rows, ["供应商编码", "送检批次数", "送检数量", "合格数量", "综合合格率"]),
+                    question="根据这张供应商质检汇总表，综合合格率最低的是哪个供应商？合格率是多少？",
+                    expected=f"{worst['供应商编码']} 最低，综合合格率 {worst['综合合格率']}。",
+                    scoring={
+                        "type": "contains_all",
+                        "terms": [worst["供应商编码"], worst["综合合格率"]],
+                    },
+                    tags=["aggregation", "quality"],
+                ),
+            )
+
+        defect = first_row(t11.rows, lambda r: num(r.get("不合格数量")) > 0 and bool(r.get("不良类别")))
+        if defect:
+            add_case(
+                cases,
+                Case(
+                    case_id="LKP-003",
+                    category="single_table_lookup",
+                    difficulty="easy",
+                    source_tables=["t11"],
+                    context=markdown_table([defect], ["质检记录ID", "批次号", "检验类型", "送检数量", "不合格数量", "检验结论", "不良类别", "不良描述"]),
+                    question=f"质检记录 `{defect.get('质检记录ID')}` 的不良类别和不良描述是什么？",
+                    expected=f"不良类别 {defect.get('不良类别')}，不良描述 {defect.get('不良描述')}。",
+                    scoring={
+                        "type": "contains_all",
+                        "terms": [defect.get("不良类别", ""), defect.get("不良描述", "")],
+                    },
+                    tags=["lookup", "quality"],
+                ),
+            )
+
+    t07 = tables.get("t07")
+    if t07 and t07.rows:
+        progress = first_row(t07.rows, lambda r: num(r.get("计划产量")) > 0 and num(r.get("已完工量")) > 0)
+        if progress:
+            rate = num(progress.get("已完工量")) / num(progress.get("计划产量"))
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-004",
+                    category="calculation",
+                    difficulty="easy",
+                    source_tables=["t07"],
+                    context=markdown_table([progress], ["工单号", "关联销售单号", "货品名称", "计划产量", "已完工量", "计划开工日", "计划完工日", "工单状态", "优先级"]),
+                    question="请计算该生产工单的完工率，并说明当前工单状态和优先级。",
+                    expected=f"完工率 {fmt_pct(rate)}，状态 {progress.get('工单状态')}，优先级 {progress.get('优先级')}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [progress.get("工单状态", ""), progress.get("优先级", "")],
+                        "numbers": [{"value": rate * 100, "tolerance": 0.2}],
+                    },
+                    tags=["math", "work_order"],
+                ),
+            )
+
+    t10 = tables.get("t10")
+    if t10 and t10.rows:
+        variance_rows = [
+            r for r in t10.rows if num(r.get("计划用量")) > 0 and abs(num(r.get("实际领用量")) - num(r.get("计划用量"))) > 0
+        ][:6]
+        if len(variance_rows) >= 3:
+            rows = variance_rows[:3]
+            scored = []
+            for r in rows:
+                diff = num(r.get("实际领用量")) - num(r.get("计划用量"))
+                scored.append((abs(diff), diff, r))
+            scored.sort(reverse=True, key=lambda x: x[0])
+            _, diff, row = scored[0]
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-005",
+                    category="calculation",
+                    difficulty="medium",
+                    source_tables=["t10"],
+                    context=markdown_table(rows, ["领用记录ID", "工单号", "物料编码", "物料名称", "计划用量", "实际领用量", "领用日期"]),
+                    question="这 3 条领用记录中，哪一条实际领用量与计划用量偏差最大？偏差是多少？正数表示超领，负数表示少领。",
+                    expected=f"{row.get('领用记录ID')} 偏差最大，偏差 {fmt_number(diff)}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [row.get("领用记录ID", "")],
+                        "numbers": [{"value": diff, "tolerance": 0.01}],
+                    },
+                    tags=["math", "variance"],
+                ),
+            )
+
+        by_mo = [rows for rows in group_by(t10.rows, "工单号").values() if len(rows) >= 2]
+        if by_mo:
+            rows = by_mo[0][:4]
+            plan = sum(num(r.get("计划用量")) for r in rows)
+            actual = sum(num(r.get("实际领用量")) for r in rows)
+            diff = actual - plan
+            add_case(
+                cases,
+                Case(
+                    case_id="AGG-002",
+                    category="aggregation",
+                    difficulty="medium",
+                    source_tables=["t10"],
+                    context=markdown_table(rows, ["领用记录ID", "工单号", "物料编码", "计划用量", "实际领用量"]),
+                    question=f"请汇总工单 `{rows[0].get('工单号')}` 这些领用记录的计划用量、实际领用量和总偏差。",
+                    expected=f"计划用量 {fmt_number(plan)}，实际领用量 {fmt_number(actual)}，总偏差 {fmt_number(diff)}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [rows[0].get("工单号", "")],
+                        "numbers": [
+                            {"value": plan, "tolerance": 0.01},
+                            {"value": actual, "tolerance": 0.01},
+                            {"value": diff, "tolerance": 0.01},
+                        ],
+                    },
+                    tags=["aggregation", "variance"],
+                ),
+            )
+
+    t12 = tables.get("t12")
+    if t12 and t12.rows:
+        abnormal = [r for r in t12.rows if r.get("是否异常") == "Y"]
+        if abnormal:
+            row = abnormal[0]
+            value = num(row.get("参数值"))
+            low = num(row.get("标准下限"))
+            high = num(row.get("标准上限"))
+            if value < low:
+                gap = low - value
+                direction = "低于下限"
+            elif value > high:
+                gap = value - high
+                direction = "高于上限"
+            else:
+                gap = 0
+                direction = "标记异常但数值未超上下限"
+            neighbors = abnormal[:1] + [r for r in t12.rows if r.get("是否异常") != "Y"][:3]
+            add_case(
+                cases,
+                Case(
+                    case_id="ANM-001",
+                    category="anomaly_detection",
+                    difficulty="medium",
+                    source_tables=["t12"],
+                    context=markdown_table(neighbors, ["计量记录ID", "设备/仪表名称", "参数项名称", "参数值", "单位", "标准下限", "标准上限", "是否异常", "异常说明", "关联工单号"]),
+                    question="找出标记为异常的计量记录，说明参数值相对标准范围的偏离方向和偏离量。",
+                    expected=f"{row.get('计量记录ID')} 异常，{direction} {fmt_number(gap, 3)} {row.get('单位')}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [row.get("计量记录ID", ""), "异常", direction],
+                        "numbers": [{"value": gap, "tolerance": 0.005}],
+                    },
+                    tags=["anomaly", "measurement"],
+                ),
+            )
+
+        by_mo = []
+        for mo, rows in group_by(t12.rows, "关联工单号").items():
+            if mo and any(r.get("是否异常") == "Y" for r in rows):
+                by_mo.append(rows)
+        if by_mo:
+            rows = by_mo[0][:8]
+            count = sum(1 for r in rows if r.get("是否异常") == "Y")
+            abnormal_names = [r.get("参数项名称", "") for r in rows if r.get("是否异常") == "Y"]
+            add_case(
+                cases,
+                Case(
+                    case_id="AGG-003",
+                    category="aggregation",
+                    difficulty="medium",
+                    source_tables=["t12"],
+                    context=markdown_table(rows, ["计量记录ID", "关联工单号", "参数项名称", "参数值", "标准下限", "标准上限", "是否异常"]),
+                    question=f"工单 `{rows[0].get('关联工单号')}` 在这些计量记录中有几条异常？涉及哪些参数项？",
+                    expected=f"异常 {count} 条，参数项: {'、'.join(abnormal_names)}。",
+                    scoring={
+                        "type": "contains_all",
+                        "terms": [str(count)] + [x for x in abnormal_names if x],
+                    },
+                    tags=["aggregation", "anomaly"],
+                ),
+            )
+
+    t08 = tables.get("t08")
+    if t08 and t08.rows:
+        inv = first_row(t08.rows, lambda r: num(r.get("账面数量")) > 0 and num(r.get("冻结量")) > 0)
+        if inv:
+            rate = num(inv.get("可用量")) / num(inv.get("账面数量"))
+            add_case(
+                cases,
+                Case(
+                    case_id="CAL-006",
+                    category="calculation",
+                    difficulty="easy",
+                    source_tables=["t08"],
+                    context=markdown_table([inv], ["库存记录ID", "物料/货品编码", "物料/货品名称", "仓库名称", "账面数量", "冻结量", "可用量", "快照日期"]),
+                    question="请计算该库存记录的可用率，可用率=可用量/账面数量。",
+                    expected=f"可用率 {fmt_pct(rate)}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [inv.get("库存记录ID", "")],
+                        "numbers": [{"value": rate * 100, "tolerance": 0.2}],
+                    },
+                    tags=["math", "inventory"],
+                ),
+            )
+            add_case(
+                cases,
+                Case(
+                    case_id="FMT-001",
+                    category="structured_output",
+                    difficulty="medium",
+                    source_tables=["t08"],
+                    context=markdown_table([inv], ["库存记录ID", "物料/货品编码", "仓库编码", "仓库名称", "账面数量", "冻结量", "可用量"]),
+                    question="请输出 JSON，字段为 material_code、warehouse、available_qty、frozen_qty、available_rate_pct。available_rate_pct 保留 1 位小数。",
+                    expected=json.dumps(
+                        {
+                            "material_code": inv.get("物料/货品编码"),
+                            "warehouse": inv.get("仓库名称"),
+                            "available_qty": int(num(inv.get("可用量"))),
+                            "frozen_qty": int(num(inv.get("冻结量"))),
+                            "available_rate_pct": round(rate * 100, 1),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    scoring={
+                        "type": "json_fields",
+                        "fields": {
+                            "material_code": inv.get("物料/货品编码"),
+                            "warehouse": inv.get("仓库名称"),
+                            "available_qty": int(num(inv.get("可用量"))),
+                            "frozen_qty": int(num(inv.get("冻结量"))),
+                            "available_rate_pct": round(rate * 100, 1),
+                        },
+                    },
+                    tags=["json", "inventory"],
+                ),
+            )
+
+    t03 = tables.get("t03")
+    if t03 and t03.rows:
+        current = [r for r in t03.rows if r.get("是否当前版本") == "Y"]
+        parents = [rows for rows in group_by(current, "父项编码").values() if len(rows) >= 3]
+        if parents:
+            rows = parents[0][:3]
+            build_qty = 120
+            expected_numbers = []
+            material_bits = []
+            for r in rows:
+                required = num(r.get("单位用量")) * build_qty
+                expected_numbers.append({"value": required, "tolerance": 0.01})
+                material_bits.append(f"{r.get('子项编码')} 需要 {fmt_number(required)} {r.get('单位')}")
+            add_case(
+                cases,
+                Case(
+                    case_id="BOM-001",
+                    category="bom_explosion",
+                    difficulty="medium",
+                    source_tables=["t03"],
+                    context=markdown_table(rows, ["父项编码", "父项名称", "子项编码", "子项名称", "单位用量", "单位", "BOM版本", "是否当前版本"]),
+                    question=f"如果要生产 {build_qty} 台父项 `{rows[0].get('父项编码')}`，这 3 个子项分别需要多少数量？",
+                    expected="；".join(material_bits),
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [r.get("子项编码", "") for r in rows],
+                        "numbers": expected_numbers,
+                    },
+                    tags=["bom", "math"],
+                ),
+            )
+
+        if t08:
+            inv_by_code = {}
+            for r in t08.rows:
+                inv_by_code.setdefault(r.get("物料/货品编码", ""), []).append(r)
+            selected = None
+            for bom in current:
+                inv_rows = inv_by_code.get(bom.get("子项编码", ""))
+                if inv_rows and num(bom.get("单位用量")) > 0:
+                    selected = (bom, inv_rows[0])
+                    break
+            if selected:
+                bom, inv = selected
+                unit_qty = num(bom.get("单位用量"))
+                available = num(inv.get("可用量"))
+                build_qty = int(available // unit_qty) + 10 if unit_qty else 10
+                required = unit_qty * build_qty
+                shortage = max(required - available, 0)
+                add_case(
+                    cases,
+                    Case(
+                        case_id="JOIN-002",
+                        category="cross_table_join",
+                        difficulty="hard",
+                        source_tables=["t03", "t08"],
+                        context=(
+                            "BOM 子项:\n"
+                            + markdown_table([bom], ["父项编码", "父项名称", "子项编码", "子项名称", "单位用量", "单位"])
+                            + "\n\n库存记录:\n"
+                            + markdown_table([inv], ["物料/货品编码", "物料/货品名称", "仓库名称", "账面数量", "冻结量", "可用量"])
+                        ),
+                        question=f"若计划生产 {build_qty} 台父项，库存可用量是否满足该子项需求？如果不足，缺口是多少？",
+                        expected=f"不满足，需求 {fmt_number(required)}，可用 {fmt_number(available)}，缺口 {fmt_number(shortage)}。",
+                        scoring={
+                            "type": "numeric_contains",
+                            "terms": ["不满足", bom.get("子项编码", "")],
+                            "numbers": [
+                                {"value": required, "tolerance": 0.01},
+                                {"value": shortage, "tolerance": 0.01},
+                            ],
+                        },
+                        tags=["join", "bom", "inventory"],
+                    ),
+                )
+
+    t01 = tables.get("t01")
+    if t01 and t01.rows:
+        supplier_rows = t01.rows[:6]
+        valid_count = sum(1 for r in supplier_rows if r.get("是否有效") == "Y")
+        add_case(
+            cases,
+            Case(
+                case_id="AGG-004",
+                category="aggregation",
+                difficulty="easy",
+                source_tables=["t01"],
+                context=markdown_table(supplier_rows, ["供应商编码", "供应商名称", "供应商类别", "主供物料类别", "付款条件", "是否有效"]),
+                question="这 6 个供应商中，有几个是有效供应商？请给出数量。",
+                expected=f"有效供应商 {valid_count} 个。",
+                scoring={
+                    "type": "numeric_contains",
+                    "terms": ["有效"],
+                    "numbers": [{"value": valid_count, "tolerance": 0.01}],
+                },
+                tags=["aggregation", "supplier"],
+            ),
+        )
+
+        if t05:
+            supplier_by_code = {r.get("供应商编码", ""): r for r in t01.rows}
+            joined = None
+            for po in t05.rows:
+                supplier = supplier_by_code.get(po.get("供应商编码", ""))
+                if supplier:
+                    joined = (po, supplier)
+                    break
+            if joined:
+                po, supplier = joined
+                add_case(
+                    cases,
+                    Case(
+                        case_id="JOIN-003",
+                        category="cross_table_join",
+                        difficulty="medium",
+                        source_tables=["t05", "t01"],
+                        context=(
+                            "采购订单:\n"
+                            + markdown_table([po], ["采购订单号", "供应商编码", "供应商名称", "物料名称", "采购数量", "采购状态"])
+                            + "\n\n供应商主数据:\n"
+                            + markdown_table([supplier], ["供应商编码", "供应商名称", "供应商类别", "主供物料类别", "付款条件", "是否有效"])
+                        ),
+                        question="请按供应商编码关联，说明该采购订单供应商的类别、主供物料类别、付款条件和是否有效。",
+                        expected=f"供应商类别 {supplier.get('供应商类别')}，主供物料类别 {supplier.get('主供物料类别')}，付款条件 {supplier.get('付款条件')}，是否有效 {supplier.get('是否有效')}。",
+                        scoring={
+                            "type": "contains_all",
+                            "terms": [
+                                supplier.get("供应商类别", ""),
+                                supplier.get("主供物料类别", ""),
+                                supplier.get("付款条件", ""),
+                                supplier.get("是否有效", ""),
+                            ],
+                        },
+                        tags=["join", "supplier"],
+                    ),
+                )
+
+    if t05 and t06:
+        receipts_by_po = group_by(t06.rows, "采购订单号")
+        selected_po = None
+        for po in t05.rows:
+            receipts = receipts_by_po.get(po.get("采购订单号", ""))
+            if receipts:
+                selected_po = (po, receipts[:5])
+                break
+        if selected_po:
+            po, receipts = selected_po
+            receipt_qty = sum(num(r.get("到货数量")) for r in receipts)
+            order_qty = num(po.get("采购数量"))
+            gap = order_qty - receipt_qty
+            add_case(
+                cases,
+                Case(
+                    case_id="JOIN-004",
+                    category="cross_table_join",
+                    difficulty="hard",
+                    source_tables=["t05", "t06"],
+                    context=(
+                        "采购订单行:\n"
+                        + markdown_table([po], ["采购订单号", "物料编码", "物料名称", "采购数量", "已到货量", "采购状态"])
+                        + "\n\n对应到货记录:\n"
+                        + markdown_table(receipts, ["到货单号", "采购订单号", "物料编码", "实际到货日期", "到货数量", "批次号", "检验状态"])
+                    ),
+                    question="请用到货记录汇总该采购订单号的实际到货数量，并与采购订单数量比较，计算差额。",
+                    expected=f"到货记录汇总 {fmt_number(receipt_qty)}，采购订单数量 {fmt_number(order_qty)}，差额 {fmt_number(gap)}。",
+                    scoring={
+                        "type": "numeric_contains",
+                        "terms": [po.get("采购订单号", "")],
+                        "numbers": [
+                            {"value": receipt_qty, "tolerance": 0.01},
+                            {"value": order_qty, "tolerance": 0.01},
+                            {"value": gap, "tolerance": 0.01},
+                        ],
+                    },
+                    tags=["join", "procurement"],
+                ),
+            )
+
+    if max_cases and len(cases) > max_cases:
+        rng.shuffle(cases)
+        cases = sorted(cases[:max_cases], key=lambda c: c.case_id)
+    return cases
+
+
+def extract_numbers(text: str) -> List[float]:
+    numbers: List[float] = []
+    for match in re.finditer(r"[-+]?\d+(?:\.\d+)?%?", text):
+        token = match.group(0)
+        try:
+            if token.endswith("%"):
+                numbers.append(float(token[:-1]))
+            else:
+                numbers.append(float(token))
+        except ValueError:
+            continue
+    return numbers
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    candidates = []
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        candidates.append(stripped)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def normalize_text(value: Any) -> str:
+    return str(value if value is not None else "").strip().lower().replace(" ", "")
+
+
+def score_case(case: Case, output: str) -> Dict[str, Any]:
+    scoring = case.scoring
+    scoring_type = scoring.get("type")
+    text_norm = normalize_text(output)
+
+    if scoring_type == "contains_all":
+        terms = [str(t) for t in scoring.get("terms", []) if str(t)]
+        hits = [term for term in terms if normalize_text(term) in text_norm]
+        score = len(hits) / len(terms) if terms else 0.0
+        return {
+            "score": score,
+            "passed": score >= 0.999,
+            "details": {"hits": hits, "missing": [t for t in terms if t not in hits]},
+        }
+
+    if scoring_type == "numeric_contains":
+        terms = [str(t) for t in scoring.get("terms", []) if str(t)]
+        term_hits = [term for term in terms if normalize_text(term) in text_norm]
+        numbers = extract_numbers(output)
+        expected_numbers = scoring.get("numbers", [])
+        number_hits = []
+        missing_numbers = []
+        for item in expected_numbers:
+            expected = float(item["value"])
+            tolerance = float(item.get("tolerance", 0.01))
+            hit = any(abs(value - expected) <= tolerance for value in numbers)
+            if not hit and abs(expected) <= 1:
+                hit = any(abs(value - expected * 100) <= max(tolerance * 100, 0.2) for value in numbers)
+            if hit:
+                number_hits.append(expected)
+            else:
+                missing_numbers.append(expected)
+        term_score = len(term_hits) / len(terms) if terms else 1.0
+        number_score = len(number_hits) / len(expected_numbers) if expected_numbers else 1.0
+        score = 0.35 * term_score + 0.65 * number_score
+        return {
+            "score": score,
+            "passed": score >= 0.85,
+            "details": {
+                "term_hits": term_hits,
+                "missing_terms": [t for t in terms if t not in term_hits],
+                "number_hits": number_hits,
+                "missing_numbers": missing_numbers,
+                "numbers_found": numbers,
+            },
+        }
+
+    if scoring_type == "json_fields":
+        expected_fields = scoring.get("fields", {})
+        parsed = extract_json_object(output)
+        if parsed is None:
+            return {"score": 0.0, "passed": False, "details": {"error": "no valid JSON object"}}
+        hits = []
+        missing = []
+        for key, expected in expected_fields.items():
+            actual = parsed.get(key)
+            if isinstance(expected, (int, float)):
+                actual_num = num(actual, default=float("nan"))
+                if math.isfinite(actual_num) and abs(actual_num - float(expected)) <= 0.2:
+                    hits.append(key)
+                else:
+                    missing.append({"field": key, "expected": expected, "actual": actual})
+            elif normalize_text(actual) == normalize_text(expected):
+                hits.append(key)
+            else:
+                missing.append({"field": key, "expected": expected, "actual": actual})
+        score = len(hits) / len(expected_fields) if expected_fields else 0.0
+        return {"score": score, "passed": score >= 0.999, "details": {"hits": hits, "missing": missing, "parsed": parsed}}
+
+    return {"score": 0.0, "passed": False, "details": {"error": f"unknown scoring type {scoring_type}"}}
+
+
+def call_ollama_native(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
+    body = {
+        "model": args.model,
+        "think": False,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "temperature": args.temperature,
+            "num_predict": args.max_tokens,
+        },
+    }
+    started = time.perf_counter()
+    payload = http_json(f"{args.model_base_url.rstrip('/')}/api/chat", method="POST", body=body, timeout=args.timeout)
+    elapsed = time.perf_counter() - started
+    content = str(payload.get("message", {}).get("content", ""))
+    return {
+        "content": content,
+        "latency_sec": elapsed,
+        "raw_usage": {
+            "prompt_eval_count": payload.get("prompt_eval_count"),
+            "eval_count": payload.get("eval_count"),
+            "total_duration": payload.get("total_duration"),
+            "load_duration": payload.get("load_duration"),
+            "prompt_eval_duration": payload.get("prompt_eval_duration"),
+            "eval_duration": payload.get("eval_duration"),
+        },
+    }
+
+
+def call_openai_compatible(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
+    body = {
+        "model": args.model,
+        "messages": [
+            {"role": "system", "content": "/nothink\n" + SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "stream": False,
+    }
+    headers = {"Authorization": f"Bearer {args.api_key}"}
+    started = time.perf_counter()
+    payload = http_json(
+        f"{args.openai_base_url.rstrip('/')}/chat/completions",
+        method="POST",
+        body=body,
+        headers=headers,
+        timeout=args.timeout,
+    )
+    elapsed = time.perf_counter() - started
+    choices = payload.get("choices", [])
+    content = ""
+    if choices:
+        content = str(choices[0].get("message", {}).get("content", ""))
+    return {"content": content, "latency_sec": elapsed, "raw_usage": payload.get("usage", {})}
+
+
+def call_model(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
+    if args.model_api == "openai":
+        return call_openai_compatible(args, prompt)
+    return call_ollama_native(args, prompt)
+
+
+def dataset_profile(tables: Dict[str, TableData]) -> List[Dict[str, Any]]:
+    rows = []
+    for table_id in sorted(tables):
+        table = tables[table_id]
+        rows.append(
+            {
+                "table_id": table.table_id,
+                "name": table.name,
+                "service": table.service,
+                "rows": len(table.rows),
+                "columns": len(table.columns),
+                "file": table.file,
+            }
+        )
+    return rows
+
+
+def pctl(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    idx = (len(sorted_values) - 1) * percentile
+    lo = math.floor(idx)
+    hi = math.ceil(idx)
+    if lo == hi:
+        return sorted_values[int(idx)]
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (idx - lo)
+
+
+def shorten(text: str, limit: int = 120) -> str:
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def case_to_json(case: Case) -> Dict[str, Any]:
+    return {
+        "case_id": case.case_id,
+        "category": case.category,
+        "difficulty": case.difficulty,
+        "source_tables": case.source_tables,
+        "question": case.question,
+        "context": case.context,
+        "expected": case.expected,
+        "scoring": case.scoring,
+        "tags": case.tags,
+    }
+
+
+def write_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def render_report(
+    args: argparse.Namespace,
+    tables: Dict[str, TableData],
+    cases: Sequence[Case],
+    results: Sequence[Dict[str, Any]],
+    run_id: str,
+    out_dir: Path,
+    dry_run: bool,
+) -> str:
+    profile = dataset_profile(tables)
+    total_rows = sum(item["rows"] for item in profile)
+    total_columns = sum(item["columns"] for item in profile)
+    lines: List[str] = []
+    lines.append("# Qwen9B Mock 数据 Benchmark 报告")
+    lines.append("")
+    lines.append("## 1. 基本信息")
+    lines.append("")
+    lines.append(f"- 生成时间: {utc_now_text()}")
+    lines.append(f"- Run ID: `{run_id}`")
+    lines.append(f"- 模型: `{args.model}`")
+    lines.append(f"- 模型接口模式: `{args.model_api}`")
+    lines.append(f"- 模型地址: `{args.openai_base_url if args.model_api == 'openai' else args.model_base_url}`")
+    lines.append(f"- 数据来源: `{args.source}`")
+    lines.append(f"- 测试题数: {len(cases)}")
+    lines.append(f"- 数据规模: {len(profile)} 张表 / {total_rows} 行 / {total_columns} 个字段")
+    if dry_run:
+        lines.append("- 执行状态: dry-run，仅生成题集与报告结构，未调用模型。")
+    else:
+        lines.append("- 执行状态: 已调用模型并完成自动评分。")
+    lines.append("")
+
+    lines.append("## 2. 数据集概览")
+    lines.append("")
+    lines.append("| 表ID | 表名 | 服务 | 行数 | 字段数 | 文件 |")
+    lines.append("| --- | --- | --- | ---: | ---: | --- |")
+    for item in profile:
+        lines.append(
+            f"| {item['table_id']} | {item['name']} | {item['service']} | {item['rows']} | {item['columns']} | {item['file']} |"
+        )
+    lines.append("")
+
+    lines.append("## 3. Benchmark 设计")
+    lines.append("")
+    lines.append("本次 benchmark 覆盖 API 路由、单表查询、计算、日期推理、聚合、跨表关联、BOM 展开、异常识别和结构化输出。标准答案由 CSV/mock API 数据自动计算生成，避免人工答案与数据漂移。")
+    lines.append("")
+    lines.append("| 类别 | 题数 | 目的 |")
+    lines.append("| --- | ---: | --- |")
+    category_counts: Dict[str, int] = {}
+    for case in cases:
+        category_counts[case.category] = category_counts.get(case.category, 0) + 1
+    category_desc = {
+        "api_planning": "验证模型能否选择正确服务、表、endpoint 与 token",
+        "single_table_lookup": "验证从给定行中抽取关键字段",
+        "calculation": "验证数量、金额、比例和偏差计算",
+        "date_reasoning": "验证日期比较与延期计算",
+        "aggregation": "验证小表汇总、排序和分组判断",
+        "cross_table_join": "验证 ERP/MES 跨表关联追溯",
+        "bom_explosion": "验证 BOM 单位用量展开",
+        "anomaly_detection": "验证计量异常和标准范围判断",
+        "structured_output": "验证 JSON 输出约束遵循",
+    }
+    for category, count in sorted(category_counts.items()):
+        lines.append(f"| {category} | {count} | {category_desc.get(category, '')} |")
+    lines.append("")
+
+    if results:
+        passed = sum(1 for r in results if r["passed"])
+        scores = [float(r["score"]) for r in results]
+        latencies = [float(r["latency_sec"]) for r in results]
+        lines.append("## 4. 总体结果")
+        lines.append("")
+        lines.append(f"- 通过率: {passed}/{len(results)} = {passed / len(results):.1%}")
+        lines.append(f"- 平均分: {statistics.mean(scores):.3f}")
+        lines.append(f"- 平均延迟: {statistics.mean(latencies):.2f}s")
+        lines.append(f"- P50 延迟: {pctl(latencies, 0.50):.2f}s")
+        lines.append(f"- P95 延迟: {pctl(latencies, 0.95):.2f}s")
+        lines.append("")
+
+        lines.append("## 5. 分类结果")
+        lines.append("")
+        lines.append("| 类别 | 题数 | 通过率 | 平均分 | 平均延迟 |")
+        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        by_category: Dict[str, List[Dict[str, Any]]] = {}
+        for result in results:
+            by_category.setdefault(result["category"], []).append(result)
+        for category, rows in sorted(by_category.items()):
+            cat_passed = sum(1 for r in rows if r["passed"])
+            cat_scores = [float(r["score"]) for r in rows]
+            cat_lat = [float(r["latency_sec"]) for r in rows]
+            lines.append(
+                f"| {category} | {len(rows)} | {cat_passed / len(rows):.1%} | {statistics.mean(cat_scores):.3f} | {statistics.mean(cat_lat):.2f}s |"
+            )
+        lines.append("")
+
+        lines.append("## 6. 明细结果")
+        lines.append("")
+        lines.append("| Case | 类别 | 难度 | 分数 | 通过 | 延迟 | 标准答案 | 模型 FINAL/输出摘要 |")
+        lines.append("| --- | --- | --- | ---: | --- | ---: | --- | --- |")
+        for result in results:
+            ok = "PASS" if result["passed"] else "FAIL"
+            lines.append(
+                f"| {result['case_id']} | {result['category']} | {result['difficulty']} | "
+                f"{float(result['score']):.3f} | {ok} | {float(result['latency_sec']):.2f}s | "
+                f"{shorten(result['expected'], 80)} | {shorten(result['final_answer'] or result['output'], 100)} |"
+            )
+        lines.append("")
+
+        failed = [r for r in results if not r["passed"]]
+        lines.append("## 7. 失败分析")
+        lines.append("")
+        if failed:
+            lines.append(f"共有 {len(failed)} 个 case 未通过，建议优先查看下列题目对应的原始输出 JSONL：")
+            lines.append("")
+            for result in failed[:10]:
+                lines.append(
+                    f"- `{result['case_id']}` / {result['category']} / score={float(result['score']):.3f}: "
+                    f"expected `{shorten(result['expected'], 90)}`"
+                )
+        else:
+            lines.append("所有 case 均通过。后续可以扩大题量、提高上下文长度或加入噪声字段来继续压测。")
+        lines.append("")
+
+        lines.append("## 8. 改进建议")
+        lines.append("")
+        if failed:
+            low_categories = sorted(
+                by_category.items(),
+                key=lambda kv: statistics.mean([float(r["score"]) for r in kv[1]]),
+            )[:3]
+            lines.append("- 优先优化低分类型的 prompt，尤其是要求 `FINAL:` 行、单位和 JSON 字段名的约束。")
+            lines.append("- 对跨表关联和 BOM 展开题，可以在系统提示中固定“先识别主键/关联键，再计算”的操作顺序。")
+            lines.append("- 若延迟过高，可先降低 `--max-tokens`，并保持 `think:false` 或 OpenAI 兼容接口的 `/nothink`。")
+            lines.append(
+                "- 当前相对薄弱类别: "
+                + "、".join(f"{cat}({statistics.mean([float(r['score']) for r in rows]):.2f})" for cat, rows in low_categories)
+            )
+        else:
+            lines.append("- 当前题集表现良好，可以增加更多跨源 join、长上下文检索、异常边界值和多步骤计算题。")
+            lines.append("- 建议固定温度为 0 或 0.1 做可复现评测，再用 0.7 做鲁棒性对比。")
+        lines.append("")
+    else:
+        lines.append("## 4. 待执行项")
+        lines.append("")
+        lines.append("本报告是 dry-run 版本，已验证数据加载和题集生成。请在 Mac 上启动 Ollama 后去掉 `--dry-run` 运行，即可得到第 4-8 节的真实模型结果。")
+        lines.append("")
+        lines.append("推荐命令：")
+        lines.append("")
+        lines.append("```bash")
+        lines.append("python3 benchmark/run_benchmark.py --source csv --csv-dir /path/to/mock_csv --model qwen3.5:9b")
+        lines.append("```")
+        lines.append("")
+
+    lines.append("## 9. 输出文件")
+    lines.append("")
+    out_text = out_dir.as_posix()
+    lines.append(f"- 题集: `{out_text}/cases.jsonl`")
+    lines.append(f"- 原始结果: `{out_text}/results.jsonl`")
+    lines.append(f"- 报告: `{out_text}/benchmark_report.md`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def final_answer(output: str) -> str:
+    matches = re.findall(r"FINAL\s*[:：]\s*(.+)", output, flags=re.IGNORECASE)
+    if matches:
+        return matches[-1].strip()
+    return ""
+
+
+def run(args: argparse.Namespace) -> int:
+    if args.source == "csv":
+        tables = load_from_csv(args.csv_dir)
+    elif args.source == "api":
+        tables = load_from_api(args)
+    else:
+        try:
+            tables = load_from_csv(args.csv_dir)
+            args.source = "csv"
+        except Exception:
+            tables = load_from_api(args)
+            args.source = "api"
+
+    cases = build_cases(tables, max_cases=args.max_cases)
+    if not cases:
+        raise RuntimeError("No benchmark cases could be generated from the available tables")
+
+    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_dir) / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    write_jsonl(out_dir / "cases.jsonl", [case_to_json(case) for case in cases])
+
+    results: List[Dict[str, Any]] = []
+    if not args.dry_run:
+        for index, case in enumerate(cases, start=1):
+            print(f"[{index}/{len(cases)}] {case.case_id} {case.category}", flush=True)
+            model_result = call_model(args, case.prompt())
+            score = score_case(case, model_result["content"])
+            record = {
+                "run_id": run_id,
+                "case_id": case.case_id,
+                "category": case.category,
+                "difficulty": case.difficulty,
+                "source_tables": case.source_tables,
+                "question": case.question,
+                "expected": case.expected,
+                "output": model_result["content"],
+                "final_answer": final_answer(model_result["content"]),
+                "score": score["score"],
+                "passed": score["passed"],
+                "score_details": score["details"],
+                "latency_sec": model_result["latency_sec"],
+                "raw_usage": model_result["raw_usage"],
+            }
+            results.append(record)
+            write_jsonl(out_dir / "results.jsonl", results)
+            if args.sleep_sec > 0:
+                time.sleep(args.sleep_sec)
+    else:
+        write_jsonl(out_dir / "results.jsonl", [])
+
+    report = render_report(args, tables, cases, results, run_id, out_dir, dry_run=args.dry_run)
+    report_path = out_dir / "benchmark_report.md"
+    report_path.write_text(report, encoding="utf-8", newline="\n")
+
+    print(f"\nCases: {out_dir / 'cases.jsonl'}")
+    print(f"Results: {out_dir / 'results.jsonl'}")
+    print(f"Report: {report_path}")
+    if results:
+        passed = sum(1 for r in results if r["passed"])
+        print(f"Pass rate: {passed}/{len(results)} = {passed / len(results):.1%}")
+    return 0
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run a local Qwen/Ollama benchmark on ERP/MES mock data.")
+    parser.add_argument("--source", choices=["auto", "csv", "api"], default="csv", help="Where to load mock data from.")
+    parser.add_argument("--csv-dir", default="./mock_csv", help="Directory containing T*.csv files.")
+    parser.add_argument("--erp-api", default=DEFAULT_ERP_API, help="ERP mock API base URL.")
+    parser.add_argument("--mes-api", default=DEFAULT_MES_API, help="MES mock API base URL.")
+    parser.add_argument("--erp-token", default=DEFAULT_ERP_TOKEN, help="ERP mock API token.")
+    parser.add_argument("--mes-token", default=DEFAULT_MES_TOKEN, help="MES mock API token.")
+    parser.add_argument("--model-api", choices=["ollama", "openai"], default="ollama", help="Model API style.")
+    parser.add_argument("--model-base-url", default="http://localhost:11434", help="Ollama native API base URL.")
+    parser.add_argument("--openai-base-url", default="http://localhost:11434/v1", help="OpenAI-compatible base URL.")
+    parser.add_argument("--api-key", default="ollama", help="API key for OpenAI-compatible mode.")
+    parser.add_argument("--model", default="qwen3.5:9b", help="Model name.")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Low temperature is recommended for reproducible benchmark runs.")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Maximum output tokens.")
+    parser.add_argument("--timeout", type=float, default=120, help="Per-case request timeout in seconds.")
+    parser.add_argument("--max-cases", type=int, default=0, help="Optional cap on generated cases; 0 means all.")
+    parser.add_argument("--sleep-sec", type=float, default=0.0, help="Sleep between model calls.")
+    parser.add_argument("--out-dir", default="benchmark/outputs", help="Output directory.")
+    parser.add_argument("--run-id", default="", help="Optional stable run id.")
+    parser.add_argument("--dry-run", action="store_true", help="Only load data, generate cases, and write a report skeleton.")
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    try:
+        return run(parse_args())
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
