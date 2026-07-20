@@ -1,0 +1,11 @@
+# 1. 进入目录
+cd model_harness
+
+# 2. 先验证环境（确保 Ollama 在线 + Mock API 可达）
+bash test_harness.sh
+
+# 3. 验证通过后，启动 24/7 循环
+bash start_harness.sh
+
+# 4. 需要停止时
+bash stop_harness.sh
