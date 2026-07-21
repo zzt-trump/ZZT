@@ -1,0 +1,41 @@
+{
+  "skill_id": "correlation_analysis",
+  "version": "v1",
+  "domain": "chemical_process",
+  "description": "对两个位号的时序数据进行相关性分析，包括 Pearson 相关系数和时滞互相关",
+  "requirements": [
+    {"id": "tag1_name", "label": "位号1", "type": "input", "description": "第一个位号名称，如 FI35111"},
+    {"id": "tag2_name", "label": "位号2", "type": "input", "description": "第二个位号名称，如 FI35116"},
+    {"id": "time_window", "label": "时间窗口", "type": "input", "description": "分析的时间范围，包含开始和结束时间"}
+  ],
+  "evidence_types": {
+    "tags_confirmed": {"type": "entity_reference", "description": "已确认的两个位号名"},
+    "time_series_pair": {"type": "query_result", "description": "两个位号在时间窗口内的时序数据"},
+    "correlation_result": {"type": "analysis_result", "description": "相关性分析结果，包含 Pearson r、强度、方向和最大时滞"}
+  },
+  "capabilities": [
+    {"id": "confirm_tags", "label": "确认位号", "description": "确认要分析的两个位号名称，确保两个位号都在数据集中存在",
+     "requires": ["tag1_name","tag2_name"], "produces": ["tags_confirmed"], "binding": "noop"},
+    {"id": "load_pair_data", "label": "加载双位号数据", "description": "加载两个位号在时间窗口内的时序数据，仅使用 quality=192 的有效数据点",
+     "requires": ["tags_confirmed","time_window"], "produces": ["time_series_pair"],
+     "binding": "analysis.correlation"},
+    {"id": "compute_correlation", "label": "计算相关性", "description": "计算两个位号的 Pearson 相关系数和时滞互相关，输出 r、strength、direction 和 max_lag",
+     "requires": ["time_series_pair"], "produces": ["correlation_result"],
+     "binding": "analysis.correlation"},
+    {"id": "report_correlation", "label": "报告结果", "description": "输出相关性分析结果，包含相关系数和时滞信息",
+     "requires": ["correlation_result"], "produces": ["__final__"], "binding": "noop"}
+  ],
+  "completion": {"requires": ["correlation_result"], "description": "相关性分析结果已产生时可完成"},
+  "phases": [
+    {"id": "grounding", "label": "意图理解", "capabilities": ["confirm_tags"], "description": "确认用户要分析的两个位号"},
+    {"id": "execution", "label": "执行分析", "capabilities": ["load_pair_data", "compute_correlation"], "description": "加载双位号数据并计算相关性"},
+    {"id": "reporting", "label": "报告结果", "capabilities": ["report_correlation"], "description": "输出分析结果"}
+  ],
+  "failure_paths": [
+    {"on": "load_pair_data", "condition": "data_too_few", "description": "任一数据序列不足10个点时无法计算相关性", "recovery": "report_correlation", "message": "数据点不足，无法进行相关性分析"},
+    {"on": "load_pair_data", "condition": "tag_not_found", "description": "任一位号在数据集中不存在", "recovery": "confirm_tags", "message": "位号不存在，请确认位号名称"}
+  ],
+  "bindings": {
+    "analysis.correlation": {"tool": "analysis.correlation", "params": {"tag1":"$tags_confirmed.1","tag2":"$tags_confirmed.2","start":"$time_window.start","end":"$time_window.end"}}
+  }
+}

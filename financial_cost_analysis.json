@@ -1,0 +1,165 @@
+{
+  "skill_id": "financial_cost_analysis",
+  "version": "v1",
+  "domain": "financial",
+  "description": "对指定产品在特定期间内的生产成本进行分析，包括材料成本、人工成本和制造费用的归集与构成分析",
+  "requirements": [
+    {
+      "id": "product_id",
+      "label": "产品编号",
+      "type": "input",
+      "description": "要分析的产品编号，如 P001"
+    },
+    {
+      "id": "time_period",
+      "label": "分析期间",
+      "type": "input",
+      "description": "成本分析的时间范围，包含开始和结束日期"
+    },
+    {
+      "id": "cost_category",
+      "label": "成本类别",
+      "type": "input",
+      "description": "成本类别：material（材料）/ labor（人工）/ overhead（制造费用）/ all（全部）"
+    }
+  ],
+  "evidence_types": {
+    "product_confirmed": {
+      "type": "entity_reference",
+      "description": "已确认的标准产品编号"
+    },
+    "cost_raw_data": {
+      "type": "query_result",
+      "description": "产品在指定期间内的原始成本数据，包含材料成本、人工工时和制造费用明细"
+    },
+    "cost_analysis_result": {
+      "type": "analysis_result",
+      "description": "成本分析结果，包含总成本、各项成本占比、环比变化和成本构成明细"
+    }
+  },
+  "capabilities": [
+    {
+      "id": "confirm_product",
+      "label": "确认产品",
+      "description": "确认要分析的产品编号，确保产品在系统中存在",
+      "requires": [
+        "product_id"
+      ],
+      "produces": [
+        "product_confirmed"
+      ],
+      "binding": "noop"
+    },
+    {
+      "id": "load_cost_data",
+      "label": "加载成本数据",
+      "description": "加载产品在指定期间内的成本数据，按成本类别筛选",
+      "requires": [
+        "product_confirmed",
+        "time_period",
+        "cost_category"
+      ],
+      "produces": [
+        "cost_raw_data"
+      ],
+      "binding": "analysis.financial.data_loader"
+    },
+    {
+      "id": "compute_cost_analysis",
+      "label": "计算成本构成",
+      "description": "计算成本构成分析，输出总成本、各项占比和环比变化",
+      "requires": [
+        "cost_raw_data"
+      ],
+      "produces": [
+        "cost_analysis_result"
+      ],
+      "binding": "analysis.financial.cost_analysis"
+    },
+    {
+      "id": "report_result",
+      "label": "报告结果",
+      "description": "输出成本分析结果，包含成本构成明细和关键指标",
+      "requires": [
+        "cost_analysis_result"
+      ],
+      "produces": [
+        "__final__"
+      ],
+      "binding": "noop"
+    }
+  ],
+  "completion": {
+    "requires": [
+      "cost_analysis_result"
+    ],
+    "description": "成本分析结果已产生时可完成"
+  },
+  "phases": [
+    {
+      "id": "grounding",
+      "label": "意图理解",
+      "capabilities": [
+        "confirm_product"
+      ],
+      "description": "确认用户要分析的产品"
+    },
+    {
+      "id": "execution",
+      "label": "执行分析",
+      "capabilities": [
+        "load_cost_data",
+        "compute_cost_analysis"
+      ],
+      "description": "加载成本数据并执行成本构成分析"
+    },
+    {
+      "id": "reporting",
+      "label": "报告结果",
+      "capabilities": [
+        "report_result"
+      ],
+      "description": "输出成本分析结果"
+    }
+  ],
+  "failure_paths": [
+    {
+      "on": "load_cost_data",
+      "condition": "data_not_found",
+      "description": "指定期间内没有该产品的成本数据",
+      "recovery": "report_result",
+      "message": "未找到成本数据，请确认产品编号和分析期间"
+    },
+    {
+      "on": "load_cost_data",
+      "condition": "product_not_found",
+      "description": "产品编号在系统中不存在",
+      "recovery": "confirm_product",
+      "message": "产品不存在，请确认产品编号"
+    },
+    {
+      "on": "compute_cost_analysis",
+      "condition": "insufficient_data",
+      "description": "成本数据不足，无法进行有意义的分析",
+      "recovery": "report_result",
+      "message": "成本数据不足，无法进行构成分析"
+    }
+  ],
+  "bindings": {
+    "analysis.financial.data_loader": {
+      "tool": "analysis.financial.data_loader",
+      "params": {
+        "product": "$product_confirmed",
+        "start": "$time_period.start",
+        "end": "$time_period.end",
+        "category": "$cost_category"
+      }
+    },
+    "analysis.financial.cost_analysis": {
+      "tool": "analysis.financial.cost_analysis",
+      "params": {
+        "data": "$cost_raw_data"
+      }
+    }
+  }
+}

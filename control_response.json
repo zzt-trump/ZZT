@@ -1,0 +1,40 @@
+{
+  "skill_id": "control_response_analysis",
+  "version": "v1",
+  "domain": "chemical_process",
+  "description": "对控制回路的 MV-PV 响应进行分析，检测 MV 阶跃事件并分析 PV 的响应特性",
+  "requirements": [
+    {"id": "controller_name", "label": "控制器名", "type": "input", "description": "控制器前缀，如 FIC35111，系统将自动查找 _MV 和 _PV 后缀的位号"},
+    {"id": "time_window", "label": "时间窗口", "type": "input", "description": "分析的时间范围，包含开始和结束时间"}
+  ],
+  "evidence_types": {
+    "controller_confirmed": {"type": "entity_reference", "description": "已确认的控制器名"},
+    "mv_pv_data": {"type": "query_result", "description": "MV 和 PV 的时序数据"},
+    "control_response_result": {"type": "analysis_result", "description": "控制响应分析结果，包含 MV 阶跃事件列表和 PV 响应统计"}
+  },
+  "capabilities": [
+    {"id": "confirm_controller", "label": "确认控制器", "description": "确认要分析的控制器名称，确保控制器在数据集中存在",
+     "requires": ["controller_name"], "produces": ["controller_confirmed"], "binding": "noop"},
+    {"id": "load_control_data", "label": "加载控制数据", "description": "加载控制器对应的 MV 和 PV 时序数据，仅使用 quality=192 的有效数据点",
+     "requires": ["controller_confirmed", "time_window"], "produces": ["mv_pv_data"],
+     "binding": "analysis.control_response"},
+    {"id": "analyze_response", "label": "分析控制响应", "description": "检测 MV 阶跃事件并分析 PV 的响应方向和幅度",
+     "requires": ["mv_pv_data"], "produces": ["control_response_result"],
+     "binding": "analysis.control_response"},
+    {"id": "report_control_response", "label": "报告结果", "description": "输出控制响应分析结果，包含 MV 阶跃事件数量和 PV 响应统计",
+     "requires": ["control_response_result"], "produces": ["__final__"], "binding": "noop"}
+  ],
+  "completion": {"requires": ["control_response_result"], "description": "控制响应分析结果已产生时可完成"},
+  "phases": [
+    {"id": "grounding", "label": "意图理解", "capabilities": ["confirm_controller"], "description": "确认用户要分析的控制器"},
+    {"id": "execution", "label": "执行分析", "capabilities": ["load_control_data", "analyze_response"], "description": "加载 MV/PV 数据并执行控制响应分析"},
+    {"id": "reporting", "label": "报告结果", "capabilities": ["report_control_response"], "description": "输出分析结果"}
+  ],
+  "failure_paths": [
+    {"on": "load_control_data", "condition": "data_too_few", "description": "MV 或 PV 数据不足10个点时无法分析", "recovery": "report_control_response", "message": "数据点不足，无法进行控制响应分析"},
+    {"on": "load_control_data", "condition": "controller_not_found", "description": "控制器对应的 MV/PV 位号在数据集中不存在", "recovery": "confirm_controller", "message": "控制器不存在，请确认控制器名称"}
+  ],
+  "bindings": {
+    "analysis.control_response": {"tool": "analysis.control_response", "params": {"tag_base":"$controller_confirmed","start":"$time_window.start","end":"$time_window.end"}}
+  }
+}

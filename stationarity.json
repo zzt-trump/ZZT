@@ -1,0 +1,41 @@
+{
+  "skill_id": "stationarity_analysis",
+  "version": "v1",
+  "domain": "chemical_process",
+  "description": "对单个位号的时序数据进行平稳性检验，判断数据是否在统计意义上平稳",
+  "requirements": [
+    {"id": "tag_name", "label": "位号名", "type": "input", "description": "用户要分析的位号名称，如 FI35111"},
+    {"id": "time_window", "label": "时间窗口", "type": "input", "description": "分析的时间范围，包含开始和结束时间"}
+  ],
+  "evidence_types": {
+    "tag_confirmed": {"type": "entity_reference", "description": "已确认的标准位号名"},
+    "time_series_data": {"type": "query_result", "description": "位号在时间窗口内的时序数据"},
+    "stationarity_result": {"type": "analysis_result", "description": "平稳性分析结果，包含 ADF 统计量、分段均值、整体均值/标准差"}
+  },
+  "capabilities": [
+    {"id": "confirm_tag", "label": "确认位号", "description": "确认要分析的位号名称，确保位号在数据集中存在",
+     "requires": ["tag_name"], "produces": ["tag_confirmed"], "binding": "noop"},
+    {"id": "load_data", "label": "加载数据", "description": "加载位号在时间窗口内的时序数据，仅使用 quality=192 的有效数据点",
+     "requires": ["tag_confirmed", "time_window"], "produces": ["time_series_data"],
+     "binding": "analysis.stationarity"},
+    {"id": "compute_stationarity", "label": "计算平稳性", "description": "对数据进行 ADF 启发式平稳性检验，输出 is_stationary、overall_mean、overall_std、segment_means 和 reason",
+     "requires": ["time_series_data"], "produces": ["stationarity_result"],
+     "binding": "analysis.stationarity"},
+    {"id": "report_result", "label": "报告结果", "description": "输出平稳性分析结果，包含是否平稳的判断和统计量",
+     "requires": ["stationarity_result"], "produces": ["__final__"],
+     "binding": "noop"}
+  ],
+  "completion": {"requires": ["stationarity_result"], "description": "平稳性分析结果已产生时可完成"},
+  "phases": [
+    {"id": "grounding", "label": "意图理解", "capabilities": ["confirm_tag"], "description": "确认用户要分析的位号"},
+    {"id": "execution", "label": "执行分析", "capabilities": ["load_data", "compute_stationarity"], "description": "加载数据并执行平稳性检验"},
+    {"id": "reporting", "label": "报告结果", "capabilities": ["report_result"], "description": "输出分析结果"}
+  ],
+  "failure_paths": [
+    {"on": "load_data", "condition": "data_too_few", "description": "数据点不足12个时无法进行平稳性检验", "recovery": "report_result", "message": "数据点不足，无法进行平稳性分析"},
+    {"on": "load_data", "condition": "tag_not_found", "description": "位号在数据集中不存在", "recovery": "confirm_tag", "message": "位号不存在，请确认位号名称"}
+  ],
+  "bindings": {
+    "analysis.stationarity": {"tool": "analysis.stationarity", "params": {"tag": "$tag_confirmed", "start": "$time_window.start", "end": "$time_window.end"}}
+  }
+}

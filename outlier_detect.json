@@ -1,0 +1,37 @@
+{
+  "skill_id": "outlier_detection",
+  "version": "v1",
+  "domain": "chemical_process",
+  "description": "对单个位号的时序数据进行异常值检测，使用 IQR 和 Z-score 双重方法",
+  "requirements": [
+    {"id": "tag_name", "label": "位号名", "type": "input", "description": "要检测异常的位号名称，如 FI35111"},
+    {"id": "time_window", "label": "时间窗口", "type": "input", "description": "检测的时间范围，包含开始和结束时间"}
+  ],
+  "evidence_types": {
+    "tag_confirmed": {"type": "entity_reference", "description": "已确认的标准位号名"},
+    "time_series_data": {"type": "query_result", "description": "位号在时间窗口内的时序数据"},
+    "outlier_result": {"type": "analysis_result", "description": "异常值检测结果，包含 IQR 和 Z-score 两种方法的统计量"}
+  },
+  "capabilities": [
+    {"id": "confirm_tag", "label": "确认位号", "description": "确认要分析的位号名称",
+     "requires": ["tag_name"], "produces": ["tag_confirmed"], "binding": "noop"},
+    {"id": "load_outlier_data", "label": "加载数据", "description": "加载位号在时间窗口内的时序数据",
+     "requires": ["tag_confirmed","time_window"], "produces": ["time_series_data"], "binding": "analysis.outlier_detect"},
+    {"id": "detect_outliers", "label": "检测异常值", "description": "使用 IQR 和 Z-score 方法检测异常值",
+     "requires": ["time_series_data"], "produces": ["outlier_result"], "binding": "analysis.outlier_detect"},
+    {"id": "report_outliers", "label": "报告结果", "description": "输出异常值检测结果，包括 IQR 和 Z-score 两个维度的报告",
+     "requires": ["outlier_result"], "produces": ["__final__"], "binding": "noop"}
+  ],
+  "completion": {"requires": ["outlier_result"], "description": "异常值检测结果已产生时可完成"},
+  "phases": [
+    {"id": "grounding", "label": "意图理解", "capabilities": ["confirm_tag"], "description": "确认用户要分析的位号"},
+    {"id": "execution", "label": "执行分析", "capabilities": ["load_outlier_data", "detect_outliers"], "description": "加载数据并执行异常值检测"},
+    {"id": "reporting", "label": "报告结果", "capabilities": ["report_outliers"], "description": "输出分析结果"}
+  ],
+  "failure_paths": [
+    {"on": "load_outlier_data", "condition": "data_too_few", "description": "数据点不足5个时无法进行异常检测", "recovery": "report_outliers", "message": "数据点不足，无法进行异常值检测"}
+  ],
+  "bindings": {
+    "analysis.outlier_detect": {"tool": "analysis.outlier_detect", "params": {"tag":"$tag_confirmed","start":"$time_window.start","end":"$time_window.end"}}
+  }
+}
